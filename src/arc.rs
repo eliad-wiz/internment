@@ -138,6 +138,13 @@ impl<T: ?Sized + BorrowOsStr> Borrow<OsStr> for BoxRefCount<T> {
     }
 }
 
+impl<T: ?Sized + BorrowByteSlice> Borrow<[u8]> for BoxRefCount<T> {
+    #[inline(always)]
+    fn borrow(&self) -> &[u8] {
+        &self.0.data.borrow()
+    }
+}
+
 impl<T: ?Sized> Deref for BoxRefCount<T> {
     type Target = T;
     #[inline(always)]
@@ -360,6 +367,60 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     fn new_from_os_str<'a>(val: &'a OsStr) -> ArcIntern<T>
     where
         T: BorrowOsStr + From<&'a OsStr>,
+    {
+        let m = Self::get_container();
+        if let Some(b) = m.get_mut(val) {
+            let b = b.key();
+            // First increment the count.  We are holding the write mutex here.
+            // Has to be the write mutex to avoid a race
+            let oldval = b.0.count.fetch_add(1, Ordering::SeqCst);
+            if oldval != 0 {
+                // we can only use this value if the value is not about to be freed
+                return ArcIntern {
+                    pointer: std::ptr::NonNull::from(b.0.borrow()),
+                };
+            } else {
+                // we have encountered a race condition here.
+                // we will just wait for the object to finish
+                // being freed.
+                b.0.count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        // start over with the new value
+        Self::new(val.into())
+    }
+}
+
+/// internal trait that allows us to specialize the `Borrow` trait for `[u8]`
+/// avoid the need to create an owned value first.
+pub trait BorrowByteSlice: Borrow<[u8]> {}
+
+impl BorrowByteSlice for Box<[u8]> {}
+
+/// BorrowByteSlice specialization
+impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
+    /// Intern a value from a reference with atomic reference counting.
+    ///
+    /// this is a fast-path for str, as it avoids the need to create owned
+    /// value first.
+    pub fn from_byte_slice<Q: AsRef<[u8]>>(val: Q) -> ArcIntern<T>
+    where
+        T: BorrowByteSlice + for<'a> From<&'a [u8]>,
+    {
+        // No reference only fast-path as
+        // the trait `std::borrow::Borrow<Q>` is not implemented for `Arc<T>`
+        Self::new_from_byte_slice(val.as_ref())
+    }
+
+    /// Intern a value from a reference with atomic reference counting.
+    ///
+    /// If this value has not previously been
+    /// interned, then `new` will allocate a spot for the value on the
+    /// heap and generate that value using `T::from(val)`.
+    fn new_from_byte_slice<'a>(val: &'a [u8]) -> ArcIntern<T>
+    where
+        T: BorrowByteSlice + From<&'a [u8]>,
     {
         let m = Self::get_container();
         if let Some(b) = m.get_mut(val) {
@@ -759,4 +820,15 @@ fn test_from_str() {
     assert_eq!(x, ArcIntern::from_str("hello"));
     assert_eq!(y, ArcIntern::from_ref("world"));
     assert_eq!(&*x, "hello");
+}
+
+#[test]
+fn test_from_byte_slice() {
+    let x = ArcIntern::new(Box::from(*b"hello"));
+    let y = ArcIntern::from_byte_slice(b"world");
+    assert_ne!(x, y);
+    assert_eq!(x, ArcIntern::from_ref(b"hello".as_ref()));
+    assert_eq!(x, ArcIntern::from_byte_slice(b"hello"));
+    assert_eq!(y, ArcIntern::from_ref(b"world".as_ref()));
+    assert_eq!(&*x, &Box::from(*b"hello"));
 }
