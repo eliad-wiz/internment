@@ -47,6 +47,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
 pub struct ArcIntern<T: ?Sized + Eq + Hash + Send + Sync + 'static> {
     pub(crate) pointer: std::ptr::NonNull<RefCount<T>>,
+    pub(crate) newly_interned: bool,
+}
+
+impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
+    /// Returns `true` if this value was newly inserted into the intern table,
+    /// `false` if it already existed (reused existing entry).
+    ///
+    /// This is only meaningful immediately after creation. Clones always return `false`.
+    #[inline]
+    pub fn newly_interned(&self) -> bool {
+        self.newly_interned
+    }
 }
 
 #[cfg(feature = "deepsize")]
@@ -249,6 +261,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                     // we can only use this value if the value is not about to be freed
                     return ArcIntern {
                         pointer: std::ptr::NonNull::from(b.0.borrow()),
+                        newly_interned: false,
                     };
                 } else {
                     // we have encountered a race condition here.
@@ -266,6 +279,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                         // We can insert, all is good
                         let p = ArcIntern {
                             pointer: std::ptr::NonNull::from(e.key().0.borrow()),
+                            newly_interned: true,
                         };
                         e.insert(());
                         return p;
@@ -324,6 +338,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                 // we can only use this value if the value is not about to be freed
                 return ArcIntern {
                     pointer: std::ptr::NonNull::from(b.0.borrow()),
+                    newly_interned: false,
                 };
             } else {
                 // we have encountered a race condition here.
@@ -378,6 +393,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                 // we can only use this value if the value is not about to be freed
                 return ArcIntern {
                     pointer: std::ptr::NonNull::from(b.0.borrow()),
+                    newly_interned: false,
                 };
             } else {
                 // we have encountered a race condition here.
@@ -432,6 +448,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                 // we can only use this value if the value is not about to be freed
                 return ArcIntern {
                     pointer: std::ptr::NonNull::from(b.0.borrow()),
+                    newly_interned: false,
                 };
             } else {
                 // we have encountered a race condition here.
@@ -456,6 +473,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> Clone for ArcIntern<T> {
         unsafe { self.pointer.as_ref().count.fetch_add(1, Ordering::Relaxed) };
         ArcIntern {
             pointer: self.pointer,
+            newly_interned: false,
         }
     }
 }
@@ -759,14 +777,39 @@ fn multithreading1() {
 
 #[test]
 fn arc_has_niche() {
+    // ArcIntern is pointer + bool + padding (8 + 1 + 7 = 16 bytes)
     assert_eq!(
         std::mem::size_of::<ArcIntern<String>>(),
-        std::mem::size_of::<usize>(),
+        2 * std::mem::size_of::<usize>(),
     );
+    // Option<ArcIntern> should still have the same size due to NonNull niche
     assert_eq!(
         std::mem::size_of::<Option<ArcIntern<String>>>(),
-        std::mem::size_of::<usize>(),
+        std::mem::size_of::<ArcIntern<String>>(),
     );
+}
+
+#[test]
+fn test_newly_interned() {
+    // Fresh value should be newly_interned
+    let x = ArcIntern::new("test_newly_interned_unique".to_string());
+    assert!(x.newly_interned());
+
+    // Same value interned again should NOT be newly_interned
+    let y = ArcIntern::new("test_newly_interned_unique".to_string());
+    assert!(!y.newly_interned());
+
+    // Clone should NOT be newly_interned
+    let z = x.clone();
+    assert!(!z.newly_interned());
+
+    // from_str: fresh value
+    let a = ArcIntern::<String>::from_str("test_newly_interned_str");
+    assert!(a.newly_interned());
+
+    // from_str: existing value
+    let b = ArcIntern::<String>::from_str("test_newly_interned_str");
+    assert!(!b.newly_interned());
 }
 
 #[test]

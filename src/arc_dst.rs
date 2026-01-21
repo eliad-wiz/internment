@@ -79,6 +79,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                     // we can only use this value if the value is not about to be freed
                     return ArcIntern {
                         pointer: std::ptr::NonNull::from(b.0.borrow()),
+                        newly_interned: false,
                     };
                 } else {
                     // we have encountered a race condition here.
@@ -93,6 +94,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                         // We can insert, all is good
                         let p = ArcIntern {
                             pointer: std::ptr::NonNull::from(e.key().0.borrow()),
+                            newly_interned: true,
                         };
                         e.insert(());
                         return p;
