@@ -94,7 +94,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                         let p = ArcIntern {
                             pointer: std::ptr::NonNull::from(e.key().0.borrow()),
                         };
-                        e.insert(());
+                        e.insert(None);
                         return p;
                     }
                     Entry::Occupied(e) => {
