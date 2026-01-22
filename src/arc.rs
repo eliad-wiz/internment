@@ -2,7 +2,7 @@
 use ahash::RandomState;
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Display, Pointer};
-type Container<T> = DashMap<BoxRefCount<T>, (), RandomState>;
+type Container<T> = DashMap<BoxRefCount<T>, Option<EvictCallback<T>>, RandomState>;
 type Untyped = &'static (dyn Any + Send + Sync + 'static);
 use std::borrow::Borrow;
 use std::convert::AsRef;
@@ -12,6 +12,10 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+
+/// A callback that is invoked when an interned value is evicted from the table.
+/// Receives a reference to the value being evicted.
+pub type EvictCallback<T> = Box<dyn FnOnce(&T) + Send + Sync>;
 
 use dashmap::{mapref::entry::Entry, DashMap};
 
@@ -237,7 +241,24 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     ///
     /// Note that `ArcIntern::new` is a bit slow, since it needs to check
     /// a `DashMap` which is protected by internal sharded locks.
-    pub fn new(mut val: T) -> ArcIntern<T> {
+    pub fn new(val: T) -> ArcIntern<T> {
+        Self::new_with_evict_callback(val, None).0
+    }
+
+    /// Intern a value with an optional eviction callback.
+    ///
+    /// Returns a tuple of the interned value and a boolean indicating whether
+    /// this value was newly inserted (`true`) or already existed (`false`).
+    ///
+    /// If `on_evict` is `Some` and the value is newly inserted, the callback
+    /// will be invoked when the value is evicted from the intern table (when
+    /// the last reference is dropped). This is useful for quota tracking.
+    ///
+    /// If the value already existed, the callback is dropped without being stored.
+    pub fn new_with_evict_callback(
+        mut val: T,
+        on_evict: Option<EvictCallback<T>>,
+    ) -> (ArcIntern<T>, bool) {
         loop {
             let m = Self::get_container();
             if let Some(b) = m.get_mut(&val) {
@@ -247,9 +268,12 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                 let oldval = b.0.count.fetch_add(1, Ordering::SeqCst);
                 if oldval != 0 {
                     // we can only use this value if the value is not about to be freed
-                    return ArcIntern {
-                        pointer: std::ptr::NonNull::from(b.0.borrow()),
-                    };
+                    return (
+                        ArcIntern {
+                            pointer: std::ptr::NonNull::from(b.0.borrow()),
+                        },
+                        false,
+                    );
                 } else {
                     // we have encountered a race condition here.
                     // we will just wait for the object to finish
@@ -267,8 +291,8 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                         let p = ArcIntern {
                             pointer: std::ptr::NonNull::from(e.key().0.borrow()),
                         };
-                        e.insert(());
-                        return p;
+                        e.insert(on_evict);
+                        return (p, true);
                     }
                     Entry::Occupied(e) => {
                         // Race, map already has data, go round again
@@ -490,13 +514,13 @@ impl<T: ?Sized + Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
             // deletion of the data.
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // removed is declared before m, so the mutex guard will be
-            // dropped *before* the removed content is dropped, since it
-            // might need to lock the mutex.
-            #[allow(clippy::needless_late_init)]
-            let _remove;
             let m = Self::get_container();
-            _remove = m.remove(unsafe { self.pointer.as_ref() });
+            let removed = m.remove(unsafe { self.pointer.as_ref() });
+
+            // Call evict callback if one was registered, passing the data
+            if let Some((box_refcount, Some(evict_cb))) = removed {
+                evict_cb(&box_refcount.0.data);
+            }
         }
     }
 }
@@ -767,6 +791,43 @@ fn arc_has_niche() {
         std::mem::size_of::<Option<ArcIntern<String>>>(),
         std::mem::size_of::<usize>(),
     );
+}
+
+#[test]
+fn test_new_with_evict_callback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const TEST_STR: &str = "test_new_with_evict_callback_unique";
+
+    let evict_count = Arc::new(AtomicUsize::new(0));
+    let evicted_len = Arc::new(AtomicUsize::new(0));
+
+    {
+        let cb_evict_count = evict_count.clone();
+        let cb_evicted_len = evicted_len.clone();
+
+        let (x, is_new) = ArcIntern::new_with_evict_callback(
+            TEST_STR.to_string(),
+            Some(Box::new(move |s: &String| {
+                cb_evict_count.fetch_add(1, Ordering::SeqCst);
+                cb_evicted_len.store(s.len(), Ordering::SeqCst);
+            })),
+        );
+        assert!(is_new);
+
+        // Same value interned again should NOT be newly inserted
+        let (y, is_new_y) = ArcIntern::new_with_evict_callback(TEST_STR.to_string(), None);
+        assert!(!is_new_y);
+        assert_eq!(x, y);
+
+        // Callback should not have been called yet
+        assert_eq!(evict_count.load(Ordering::SeqCst), 0);
+    }
+
+    // After all references dropped, callback should have been called once
+    assert_eq!(evict_count.load(Ordering::SeqCst), 1);
+    assert_eq!(evicted_len.load(Ordering::SeqCst), TEST_STR.len());
 }
 
 #[test]
